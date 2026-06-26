@@ -39,8 +39,22 @@ It prints a JSON report, e.g.:
 - **`dev_net_tun: OK`** ⇒ tun/VPN-style custom tunnels are possible.
 
 This probes the microVM's **own** process. Because `CapBnd` bounds nested containers too, it answers
-the sub-container question; for belt-and-suspenders, extend the image to install Docker and rerun the
-checks inside a `docker run --cap-add=NET_RAW --cap-add=NET_ADMIN` container.
+the sub-container question; the Docker-in-Docker demo below confirms it on the real path.
+
+## Docker-in-Docker demo (`dind/`)
+Proves the sandbox-spawning model — a workload launching its own sub-containers — works inside a MicroVM. It starts `dockerd`,
+does a `docker pull`, runs a nested container, and confirms the nested container can hold `NET_RAW`.
+
+```bash
+SRC_DIR=dind IMAGE_NAME=dind-probe ./setup.sh
+./teardown.sh
+```
+
+Because a MicroVM has no `NET_ADMIN`, `dockerd` runs with `--bridge=none --iptables=false` (it can't
+create Docker's default bridge / iptables NAT), and nested containers use `--network host` — so egress
+is the MicroVM's own, enforced at the platform connector rather than by in-container iptables. The JSON
+report shows the `dockerd` status, the `docker pull`, the nested run, and the nested `NET_RAW` check
+(if `dockerd` won't start, the report includes the daemon log tail).
 
 ## Clean up
 ```bash

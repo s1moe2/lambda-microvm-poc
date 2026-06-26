@@ -33,5 +33,5 @@ aws s3 rm "s3://${BUCKET}" --recursive 2>/dev/null || true
 aws s3api delete-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null \
   && echo "deleted bucket $BUCKET" || echo "bucket delete skipped"
 
-rm -f "$DIR/probe.zip" "$STATE_FILE"
+rm -f "$DIR/app.zip" "$DIR/probe.zip" "$STATE_FILE"
 echo "teardown complete."

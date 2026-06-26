@@ -10,9 +10,15 @@ ROLE_NAME="${ROLE_NAME:-MicrovmNetrawPocBuildRole}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="$DIR/.poc-state"
 
+# Folder holding the Dockerfile + app to deploy. Default: repo root (the simple probe).
+#   SRC_DIR=dind IMAGE_NAME=dind-probe ./setup.sh   # the Docker-in-Docker demo
+SRC_DIR="${SRC_DIR:-.}"
+case "$SRC_DIR" in /*) ;; *) SRC_DIR="$DIR/$SRC_DIR" ;; esac
+SRC_DIR="$(cd "$SRC_DIR" && pwd)"
+
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 BUCKET="${BUCKET:-microvm-netraw-poc-${ACCOUNT}-${REGION}}"
-echo "region=$REGION account=$ACCOUNT bucket=$BUCKET image=$IMAGE_NAME role=$ROLE_NAME"
+echo "region=$REGION account=$ACCOUNT bucket=$BUCKET image=$IMAGE_NAME role=$ROLE_NAME src=$SRC_DIR"
 
 # --- 1. S3 bucket ---
 if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
@@ -40,9 +46,9 @@ aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name build-perms --pol
 ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/${ROLE_NAME}"
 echo "waiting for IAM role to propagate..."; sleep 10
 
-# --- 3. package + upload ---
-( cd "$DIR" && rm -f probe.zip && zip -j probe.zip probe.py Dockerfile >/dev/null )
-aws s3 cp "$DIR/probe.zip" "s3://${BUCKET}/probe.zip"
+# --- 3. package + upload (Dockerfile + any *.py from $SRC_DIR; Dockerfile must sit at the archive root) ---
+( cd "$SRC_DIR" && rm -f "$DIR/app.zip" && zip -j "$DIR/app.zip" Dockerfile *.py >/dev/null )
+aws s3 cp "$DIR/app.zip" "s3://${BUCKET}/app.zip"
 
 # --- 4. build the MicroVM image (Lambda runs the Dockerfile + snapshots) ---
 # Identifiers must be the image ARN, not the name. Reuse an existing image if present.
@@ -51,7 +57,7 @@ IMAGE_ARN=$(aws lambda-microvms list-microvm-images --region "$REGION" \
 if [ -z "$IMAGE_ARN" ] || [ "$IMAGE_ARN" = "None" ]; then
   IMAGE_ARN=$(aws lambda-microvms create-microvm-image --region "$REGION" \
     --name "$IMAGE_NAME" \
-    --code-artifact uri="s3://${BUCKET}/probe.zip" \
+    --code-artifact uri="s3://${BUCKET}/app.zip" \
     --base-image-arn "arn:aws:lambda:${REGION}:aws:microvm-image:al2023-1" \
     --build-role-arn "$ROLE_ARN" --query imageArn --output text)
 fi
@@ -100,8 +106,9 @@ TOKEN=$(aws lambda-microvms create-microvm-auth-token --region "$REGION" \
   --allowed-ports '[{"allPorts":{}}]' --query authToken --output text)
 
 echo "=== PROBE RESULT ==="
+# The DinD demo starts dockerd + pulls an image on first request, so allow a generous wait.
 for i in 1 2 3 4 5 6; do
-  if curl -fsS "https://${EP}/" -H "X-aws-proxy-auth: ${TOKEN}"; then echo; break; fi
+  if curl -fsS --max-time 300 "https://${EP}/" -H "X-aws-proxy-auth: ${TOKEN}"; then echo; break; fi
   echo "  (endpoint not ready, retry $i)"; sleep 5
 done
 echo "Done. Run ./teardown.sh to remove all resources."
