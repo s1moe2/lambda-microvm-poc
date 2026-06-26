@@ -1,13 +1,13 @@
-"""Docker-in-Docker demo for a Lambda MicroVM.
+"""Docker-in-Docker diagnostic for a Lambda MicroVM.
 
-Proves the sandbox-spawning model works inside a MicroVM: starts dockerd, pulls an
-image, runs a nested container, and confirms the nested container can hold NET_RAW.
+A first run showed dockerd failing to start. This version surfaces WHY: it reports the
+capability set, the cgroup / overlay environment dockerd depends on, and the real
+dockerd/containerd error (not the truncated plugin-load noise). It tries a few start
+strategies, including the official docker:dind entrypoint (which does the cgroup/mount
+prep). If dockerd does come up, it pulls + runs a nested container and checks NET_RAW.
 
-A MicroVM has no NET_ADMIN, so dockerd cannot create Docker's default bridge or its
-iptables NAT -> it runs with --bridge=none --iptables=false, and nested containers use
---network host (egress is the MicroVM's own, enforced at the platform connector, not by
-in-container iptables). dockerd is started lazily on the first request so it does not
-depend on surviving the Firecracker snapshot/restore.
+Hypothesis under test: a MicroVM lacks CAP_SYS_ADMIN (the probe showed SYS_ADMIN=false),
+which dockerd/containerd need to mount cgroups/overlay -> DinD may be unsupported.
 
 Serves the result as JSON on :8080.
 """
@@ -17,12 +17,13 @@ import subprocess
 import time
 
 IMG = "python:3.13-alpine"
+LOG = "/var/log/dockerd.log"
 
 
-def sh(cmd, timeout=240):
+def sh(cmd, timeout=240, limit=6000):
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        return {"rc": p.returncode, "out": (p.stdout + p.stderr).strip()[:4000]}
+        return {"rc": p.returncode, "out": (p.stdout + p.stderr).strip()[:limit]}
     except subprocess.TimeoutExpired:
         return {"rc": -1, "out": f"TIMEOUT after {timeout}s"}
 
@@ -31,9 +32,29 @@ def docker_up():
     return subprocess.run("docker info", shell=True, capture_output=True).returncode == 0
 
 
-def _start(flags):
-    subprocess.Popen(f"dockerd {flags} >>/var/log/dockerd.log 2>&1", shell=True)
-    for _ in range(30):
+def env_diag():
+    return {
+        "id": sh("id"),
+        "caps": sh("grep Cap /proc/self/status"),
+        "cgroup_fstype": sh("stat -fc %T /sys/fs/cgroup 2>&1"),  # cgroup2fs => v2
+        "cgroup_mounts": sh("mount | grep -i cgroup || echo 'no cgroup mounts'"),
+        "cgroup_controllers": sh("cat /sys/fs/cgroup/cgroup.controllers 2>&1"),
+        "cgroup_writable": sh(
+            "mkdir /sys/fs/cgroup/_probe 2>&1 && echo WRITABLE && rmdir /sys/fs/cgroup/_probe "
+            "|| echo 'NOT writable'"
+        ),
+        "proc_fs_cgroup": sh("grep cgroup /proc/filesystems || echo none"),
+        "proc_fs_overlay": sh("grep overlay /proc/filesystems || echo none"),
+        "can_mount": sh("mount -t tmpfs none /mnt 2>&1 && echo 'mount OK' && umount /mnt || echo 'mount denied'"),
+    }
+
+
+def _try_start(cmd, secs=20):
+    subprocess.run("pkill -9 dockerd containerd 2>/dev/null; sleep 1", shell=True)
+    with open(LOG, "a") as f:
+        f.write(f"\n===== starting: {cmd} =====\n")
+    subprocess.Popen(f"{cmd} >>{LOG} 2>&1", shell=True)
+    for _ in range(secs):
         if docker_up():
             return True
         time.sleep(1)
@@ -43,21 +64,26 @@ def _start(flags):
 def ensure_dockerd():
     if docker_up():
         return "already running"
-    base = "--bridge=none --iptables=false"
-    if _start(base):
-        return "started"
-    # overlay2 may be unavailable in the microVM fs; retry with the vfs storage driver
-    subprocess.run("pkill dockerd 2>/dev/null", shell=True)
-    time.sleep(2)
-    if _start(base + " --storage-driver=vfs"):
-        return "started (vfs)"
-    return "FAILED (see dockerd_log)"
+    strategies = [
+        ("bare", "dockerd --bridge=none --iptables=false"),
+        ("vfs", "dockerd --bridge=none --iptables=false --storage-driver=vfs"),
+        ("dind-entrypoint", "dockerd-entrypoint.sh dockerd --bridge=none --iptables=false"),
+    ]
+    tried = []
+    for label, cmd in strategies:
+        if _try_start(cmd):
+            return f"started via {label}"
+        tried.append(label)
+    return f"FAILED (tried: {', '.join(tried)})"
 
 
 def demo():
-    out = {"dockerd": ensure_dockerd()}
+    out = {"env": env_diag(), "dockerd": ensure_dockerd()}
     if not docker_up():
-        out["dockerd_log"] = sh("tail -n 40 /var/log/dockerd.log")
+        out["dockerd_errors"] = sh(
+            f"grep -iE 'level=(error|fatal)|failed|denied|permission|cannot|no such|sys_admin' {LOG} | tail -n 30"
+        )
+        out["dockerd_tail"] = sh(f"tail -n 20 {LOG}")
         return out
     out["docker_version"] = sh("docker version --format 'server {{.Server.Version}}'")
     out["pull"] = sh(f"docker pull {IMG}")
