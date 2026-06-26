@@ -15,9 +15,13 @@ if [ -n "${MVM:-}" ]; then
   sleep 5
 fi
 
-if [ -n "${IMAGE_NAME:-}" ]; then
-  aws lambda-microvms delete-microvm-image --region "$REGION" --image-identifier "$IMAGE_NAME" 2>/dev/null \
-    && echo "deleted image $IMAGE_NAME" || echo "image delete skipped (already gone?)"
+if [ -z "${IMAGE_ARN:-}" ] && [ -n "${IMAGE_NAME:-}" ]; then
+  IMAGE_ARN=$(aws lambda-microvms list-microvm-images --region "$REGION" \
+    --query "items[?name=='${IMAGE_NAME}'].imageArn | [0]" --output text 2>/dev/null)
+fi
+if [ -n "${IMAGE_ARN:-}" ] && [ "$IMAGE_ARN" != "None" ]; then
+  aws lambda-microvms delete-microvm-image --region "$REGION" --image-identifier "$IMAGE_ARN" 2>/dev/null \
+    && echo "deleted image $IMAGE_ARN" || echo "image delete skipped (already gone?)"
 fi
 
 if [ -n "${ROLE_NAME:-}" ]; then

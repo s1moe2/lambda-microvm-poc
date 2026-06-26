@@ -45,15 +45,21 @@ echo "waiting for IAM role to propagate..."; sleep 10
 aws s3 cp "$DIR/probe.zip" "s3://${BUCKET}/probe.zip"
 
 # --- 4. build the MicroVM image (Lambda runs the Dockerfile + snapshots) ---
-aws lambda-microvms create-microvm-image --region "$REGION" \
-  --name "$IMAGE_NAME" \
-  --code-artifact uri="s3://${BUCKET}/probe.zip" \
-  --base-image-arn "arn:aws:lambda:${REGION}:aws:microvm-image:al2023-1" \
-  --build-role-arn "$ROLE_ARN" >/dev/null
+# Identifiers must be the image ARN, not the name. Reuse an existing image if present.
+IMAGE_ARN=$(aws lambda-microvms list-microvm-images --region "$REGION" \
+  --query "items[?name=='${IMAGE_NAME}'].imageArn | [0]" --output text)
+if [ -z "$IMAGE_ARN" ] || [ "$IMAGE_ARN" = "None" ]; then
+  IMAGE_ARN=$(aws lambda-microvms create-microvm-image --region "$REGION" \
+    --name "$IMAGE_NAME" \
+    --code-artifact uri="s3://${BUCKET}/probe.zip" \
+    --base-image-arn "arn:aws:lambda:${REGION}:aws:microvm-image:al2023-1" \
+    --build-role-arn "$ROLE_ARN" --query imageArn --output text)
+fi
+echo "imageArn=$IMAGE_ARN"
 
 echo "building image..."
 while true; do
-  ST=$(aws lambda-microvms get-microvm-image --region "$REGION" --image-identifier "$IMAGE_NAME" --query state --output text)
+  ST=$(aws lambda-microvms get-microvm-image --region "$REGION" --image-identifier "$IMAGE_ARN" --query state --output text)
   echo "  image: $ST"
   [ "$ST" = "CREATED" ] && break
   if [ "$ST" = "CREATE_FAILED" ]; then
@@ -64,7 +70,7 @@ done
 
 # --- 5. run a MicroVM ---
 RUN=$(aws lambda-microvms run-microvm --region "$REGION" \
-  --image-identifier "$IMAGE_NAME" \
+  --image-identifier "$IMAGE_ARN" \
   --ingress-network-connectors "arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:ALL_INGRESS" \
   --egress-network-connectors  "arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS")
 MVM=$(printf '%s' "$RUN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["microvmId"])')
@@ -76,6 +82,7 @@ REGION=$REGION
 BUCKET=$BUCKET
 ROLE_NAME=$ROLE_NAME
 IMAGE_NAME=$IMAGE_NAME
+IMAGE_ARN=$IMAGE_ARN
 MVM=$MVM
 STATEEOF
 
